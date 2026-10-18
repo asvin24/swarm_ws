@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+logs/
+*.blend1
+eeprom.bin
+terrain/
+mav.parm

@@ -1,0 +1,3 @@
+swarm:
+  num_drones: 2
+  y_spacing: 2.0
