@@ -9,12 +9,12 @@ import rclpy
 from swarm.drone_api import Swarm
 
 # Keep takeoff and ceiling strictly below the maze wall height (~2.0m - 2.5m)
-TAKEOFF_ALT = 1.2
+TAKEOFF_ALT = 1.0
 MIN_Z = 0.5
 MAX_Z = 1.8       # Hard ceiling so the LiDAR never rises above the maze walls
 XY_STEP = 0.5     # Meters per keypress
 Z_STEP = 0.2      # Altitude step per keypress
-YAW_STEP = 0.25   # Radians (~14 deg) per keypress
+YAW_STEP = 0.08   # Radians (~14 deg) per keypress
 
 HELP_MSG = """
 =====================================================
@@ -41,6 +41,12 @@ def get_key(settings, timeout=0.1):
         key = ''
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
     return key
+
+
+
+def wrap(a):
+    """Wrap an angle to [-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
 
 
 def main(args=None):
@@ -95,7 +101,13 @@ def main(args=None):
                 drone.land(wait=True)
                 break
 
-            # Continuously stream the target setpoint at ~10 Hz
+            cx, cy, _ = drone.get_pos()
+            d = math.hypot(tx - cx, ty - cy)
+            if d > 2.5:  # Allow up to 2.5m leash so ArduPilot generates enough velocity
+                tx = cx + 2.5 * (tx - cx) / d
+                ty = cy + 2.5 * (ty - cy) / d
+            tyaw = wrap(tyaw)
+
             drone.goto(tx, ty, tz, yaw=tyaw)
 
             # Live HUD on a single terminal line

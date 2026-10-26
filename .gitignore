@@ -1,8 +1,18 @@
+# Python & ROS 2 build artifacts
 __pycache__/
-*.pyc
-*.log
-logs/
-*.blend1
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+install/
+log/
+
+# ArduPilot SITL & MAVROS runtime files
 eeprom.bin
-terrain/
 mav.parm
+terrain/
+logs/
+*.log
+*.tlog
+*.bin
+*.apj
