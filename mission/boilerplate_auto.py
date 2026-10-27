@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
 Boilerplate for PointCloud-driven autonomous navigation with manual-override safety.
-Run directly: python3 auto_template.py
+Run directly: python3 boilerplate_auto.py
 
 Safety behaviour:
   * RC stick input or an external flight-mode change aborts the mission (ManualOverride).
   * After an override this script NEVER commands the drone again (no brake, no land):
     the pilot is in control. Stick input hands the drone over in LOITER; a mode switch
     leaves whatever mode the pilot chose.
-  * Ctrl+C (no override): brake, then land.
+  * Ctrl+C, a failed takeoff, or any Python error (no override): LAND and wait for disarm.
 """
 import sys
 import math
 import time
+import traceback
+
 import numpy as np
-import rclpy
 from swarm.drone_api import Swarm, Drone, ManualOverride
 
 # ---------------- Mission Hyperparameters ----------------
-FLIGHT_ALT = 1.0       # Fixed flight altitude inside maze (m)
+FLIGHT_ALT = 1.0       # Flight height above the takeoff point inside the maze (m)
 LOOP_HZ = 10.0         # Control loop frequency (Hz)
 SAFE_FRONT_DIST = 1.1  # Obstacle clearance threshold ahead (m)
 FORWARD_STEP = 0.8     # Forward leash when path is clear (m)
@@ -64,6 +65,27 @@ def compute_command(drone: Drone) -> tuple[float, float, float]:
     return (0.0, 0.0, turn_dir * TURN_STEP_RAD)
 
 
+def land_safely(drone: Drone):
+    """Land if airborne and the pilot hasn't taken over. Safe to call in any state."""
+    if drone.is_overridden():
+        drone.override_handled.wait(timeout=5.0)
+        print(f"[AUTO] Pilot has control (mode={drone.state.mode}). Not sending commands.")
+        return
+    if not drone.state.armed:
+        return
+    print("\n[AUTO] Landing...")
+    try:
+        if drone.land(wait=True):
+            return
+        if drone.state.armed and drone.state.mode != "LAND":
+            drone.set_mode("LAND")  # fallback if the land command was rejected
+        print("[AUTO] Landing not confirmed. PILOT: be ready to take over.")
+    except ManualOverride as e:
+        print(f"[AUTO] Pilot took over during landing: {e}")
+    except KeyboardInterrupt:
+        print("[AUTO] Stopped waiting; the FCU stays in LAND mode.")
+
+
 def main():
     swarm = Swarm(names=["drone0"], mapping=True)
     drone = swarm["drone0"]
@@ -72,12 +94,14 @@ def main():
     try:
         drone.connect()
         if not drone.takeoff(alt=FLIGHT_ALT, wait=True):
-            print("\n[AUTO] Takeoff command rejected. Aborting.")
+            print("\n[AUTO] Takeoff failed (see log). Aborting.")
             return
+        target_z = drone.home[2] + FLIGHT_ALT  # altitude lock, relative to the takeoff point
+
         print("\n[AUTO] Autonomous PointCloud Navigation started. Press Ctrl+C to stop & land.")
         print("[AUTO] Manual override armed: RC sticks or a mode switch will hand control to the pilot.\n")
 
-        while rclpy.ok():
+        while True:
             t_start = time.time()
 
             # 0. SAFETY: abort immediately if the pilot has taken over
@@ -86,9 +110,9 @@ def main():
             # 1. PERCEIVE & DECIDE
             fwd, left, dyaw = compute_command(drone)
 
-            # 2. ACT (keep altitude locked to FLIGHT_ALT)
+            # 2. ACT (keep altitude locked to FLIGHT_ALT above takeoff)
             cx, cy, cz = drone.get_pos()
-            dz = FLIGHT_ALT - cz
+            dz = target_z - cz
             drone.step_body(forward=fwd, left=left, dz=dz, dyaw=dyaw)
 
             # 3. TELEMETRY HUD
@@ -108,24 +132,14 @@ def main():
                 drone.wait(dt - elapsed)
 
     except ManualOverride as e:
-        # The pilot has control. Do NOT brake, land, or send any further commands.
         print(f"\n[AUTO] MANUAL OVERRIDE: {e}")
-        drone.override_handled.wait(timeout=5.0)
-        print(f"[AUTO] Script stopped. Flight mode is now: {drone.state.mode}. Pilot has control.")
-
     except KeyboardInterrupt:
-        if drone.is_overridden():
-            print("\n[AUTO] Interrupted, but the pilot already has control. Not sending commands.")
-        else:
-            print("\n[AUTO] Interrupted by user! Braking and landing...")
-            try:
-                drone.stop()
-                time.sleep(0.5)
-                drone.land(wait=True)
-            except ManualOverride as e:
-                print(f"\n[AUTO] Pilot took over during landing: {e}")
+        print("\n[AUTO] Interrupted by user.")
+    except Exception:
+        traceback.print_exc()
 
     finally:
+        land_safely(drone)
         swarm.close()
 
 

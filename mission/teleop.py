@@ -1,74 +1,122 @@
 #!/usr/bin/env python3
-import sys
-import select
-import termios
-import tty
-import math
-import time
-import rclpy
-from swarm.drone_api import Swarm
+"""
+Keyboard teleop for one drone (sim or real). All altitudes are relative to the takeoff point.
 
-# Keep takeoff and ceiling strictly below the maze wall height (~2.0m - 2.5m)
-TAKEOFF_ALT = 1.0
-MIN_Z = 0.5
-MAX_Z = 1.8       # Hard ceiling so the LiDAR never rises above the maze walls
-XY_STEP = 0.5     # Meters per keypress
-Z_STEP = 0.2      # Altitude step per keypress
-YAW_STEP = 0.08   # Radians (~14 deg) per keypress
+  Maze / sim (defaults):  python3 teleop.py
+  Outdoors with GPS:      python3 teleop.py --alt 3 --min-alt 2 --max-alt 8 --no-map
+
+Safety behaviour:
+  * RC stick input or an external flight-mode change ends teleop (ManualOverride) and the
+    script sends nothing more: the pilot is in control.
+  * L / ESC / Ctrl+C, or any Python error (no override): LAND and wait for disarm.
+"""
+import argparse
+import math
+import os
+import select
+import sys
+import termios
+import traceback
+import tty
+
+from swarm.drone_api import Swarm, Drone, ManualOverride, wrap_angle
+
+XY_STEP = 0.5     # Metres per keypress
+Z_STEP = 0.2      # Altitude step per keypress (m)
+YAW_STEP = 0.08   # Radians (~5 deg) per keypress
+LEASH = 2.5       # Max horizontal distance between target and drone (m)
 
 HELP_MSG = """
 =====================================================
-   DRONE MAZE TELEOP (Mapping Active on /drone0/map)
+   DRONE TELEOP
 =====================================================
    W / S : Forward / Backward (Body Frame)
    A / D : Strafe Left / Right (Body Frame)
    Q / E : Rotate Yaw Left / Right
-   R / F : Altitude Up / Down (Clamped: 0.5m - 1.8m)
-   SPACE : Emergency Hold / Reset Target to Current Pos
-   L     : Land and Exit
-   ESC   : Land and Exit
+   R / F : Altitude Up / Down (clamped {min_alt:.1f} - {max_alt:.1f} m above takeoff)
+   SPACE : Hold / Reset Target to Current Pos
+   L / ESC / Ctrl+C : Land and Exit
 =====================================================
 """
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="Keyboard teleop")
+    p.add_argument("--name", default="drone0", help="Drone namespace (default: drone0)")
+    p.add_argument("--alt", type=float, default=1.0, help="Takeoff height above takeoff point (m)")
+    p.add_argument("--min-alt", type=float, default=0.5, help="Lowest allowed height (m)")
+    p.add_argument("--max-alt", type=float, default=1.8, help="Highest allowed height (m)")
+    p.add_argument("--no-map", action="store_true", help="Disable 3D mapping (no LiDAR)")
+    return p.parse_args()
+
+
 def get_key(settings, timeout=0.1):
-    """Non-blocking terminal key reader."""
-    tty.setraw(sys.stdin.fileno())
-    rlist, _, _ = select.select([sys.stdin], [], [], timeout)
-    if rlist:
-        key = sys.stdin.read(1)
-    else:
-        key = ''
-    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
-    return key
+    """Non-blocking single-key reader. Arrow/function keys are ignored."""
+    fd = sys.stdin.fileno()
+    tty.setraw(fd)
+    try:
+        rlist, _, _ = select.select([fd], [], [], timeout)
+        if not rlist:
+            return ''
+        key = os.read(fd, 1).decode(errors='ignore')
+        # Arrow/function keys send ESC followed by more bytes; don't treat them as ESC (= land)
+        if key == '\x1b' and select.select([fd], [], [], 0.02)[0]:
+            os.read(fd, 16)
+            return ''
+        return key
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, settings)
 
 
+def land_safely(drone: Drone):
+    """Land if airborne and the pilot hasn't taken over. Safe to call in any state."""
+    if drone.is_overridden():
+        drone.override_handled.wait(timeout=5.0)
+        print(f"Pilot has control (mode={drone.state.mode}). Not sending commands.")
+        return
+    if not drone.state.armed:
+        return
+    print("Landing...")
+    try:
+        if drone.land(wait=True):
+            print("Landed and disarmed.")
+            return
+        if drone.state.armed and drone.state.mode != "LAND":
+            drone.set_mode("LAND")  # fallback if the land command was rejected
+        print("Landing not confirmed. PILOT: be ready to take over.")
+    except ManualOverride as e:
+        print(f"Pilot took over during landing: {e}")
+    except KeyboardInterrupt:
+        print("Stopped waiting; the FCU stays in LAND mode.")
 
-def wrap(a):
-    """Wrap an angle to [-pi, pi]."""
-    return math.atan2(math.sin(a), math.cos(a))
 
+def main():
+    args = parse_args()
+    if not (0.0 < args.min_alt <= args.alt <= args.max_alt):
+        raise SystemExit("Need 0 < --min-alt <= --alt <= --max-alt")
 
-def main(args=None):
     settings = termios.tcgetattr(sys.stdin)
-
-    # Start Swarm API with 1 drone and live 2D OccupancyGrid mapping enabled
-    swarm = Swarm(names=["drone0"], mapping=True)
-    drone = swarm["drone0"]
+    swarm = Swarm(names=[args.name], mapping=not args.no_map)
+    drone = swarm[args.name]
 
     try:
         drone.connect()
-        print(f"Taking off to {TAKEOFF_ALT}m (staying below maze wall height)...")
-        drone.takeoff(alt=TAKEOFF_ALT, wait=True)
+        print(f"Taking off to {args.alt:.1f} m above takeoff point...")
+        if not drone.takeoff(alt=args.alt, wait=True):
+            print("Takeoff failed (see log).")
+            return
+
+        hz = drone.home[2]
+        z_lo, z_hi = hz + args.min_alt, hz + args.max_alt
 
         # Initialize target setpoint from the drone's actual hover position
         tx, ty, tz = drone.get_pos()
         _, _, tyaw = drone.get_rpy()
-        tz = min(max(tz, MIN_Z), MAX_Z)
+        tz = min(max(tz, z_lo), z_hi)
 
-        print(HELP_MSG)
+        print(HELP_MSG.format(min_alt=args.min_alt, max_alt=args.max_alt))
 
-        while rclpy.ok():
+        while True:
             key = get_key(settings, timeout=0.1).lower()
 
             if key == 'w':
@@ -88,25 +136,25 @@ def main(args=None):
             elif key == 'e':
                 tyaw -= YAW_STEP
             elif key == 'r':
-                tz = min(MAX_Z, tz + Z_STEP)
+                tz = min(z_hi, tz + Z_STEP)
             elif key == 'f':
-                tz = max(MIN_Z, tz - Z_STEP)
+                tz = max(z_lo, tz - Z_STEP)
             elif key == ' ':
                 # Snap target immediately to current position to halt motion
                 tx, ty, tz = drone.get_pos()
+                tz = min(max(tz, z_lo), z_hi)
                 _, _, tyaw = drone.get_rpy()
                 print("\r[HOLD] Target snapped to current position.          ")
-            elif key in ('l', '\x1b', '\x03'):  # 'l', ESC, or Ctrl+C
-                print("\r\nLanding drone...")
-                drone.land(wait=True)
-                break
+            elif key in ('l', '\x1b', '\x03'):  # 'l', ESC, or Ctrl+C (raw mode)
+                print("\r")
+                break  # landing happens in finally
 
             cx, cy, _ = drone.get_pos()
             d = math.hypot(tx - cx, ty - cy)
-            if d > 2.5:  # Allow up to 2.5m leash so ArduPilot generates enough velocity
-                tx = cx + 2.5 * (tx - cx) / d
-                ty = cy + 2.5 * (ty - cy) / d
-            tyaw = wrap(tyaw)
+            if d > LEASH:  # leash keeps the target close enough for a sane velocity
+                tx = cx + LEASH * (tx - cx) / d
+                ty = cy + LEASH * (ty - cy) / d
+            tyaw = wrap_angle(tyaw)
 
             drone.goto(tx, ty, tz, yaw=tyaw)
 
@@ -114,17 +162,24 @@ def main(args=None):
             cx, cy, cz = drone.get_pos()
             front_dist = drone.min_dist(-30.0, 30.0)
             sys.stdout.write(
-                f"\rPos: ({cx:5.2f}, {cy:5.2f}, {cz:4.2f}m) | "
-                f"Target: ({tx:5.2f}, {ty:5.2f}, {tz:4.2f}m) | "
-                f"Yaw: {math.degrees(tyaw):5.1f}° | "
-                f"Front Wall: {front_dist:4.2f}m   "
+                f"\rPos: ({cx:5.2f}, {cy:5.2f}) Alt: {cz - hz:4.2f}m | "
+                f"Target: ({tx:5.2f}, {ty:5.2f}) Alt: {tz - hz:4.2f}m | "
+                f"Yaw: {math.degrees(tyaw):6.1f}° | "
+                f"Front: {front_dist:4.2f}m   "
             )
             sys.stdout.flush()
 
-    except Exception as e:
-        print(f"\nError: {e}")
+    except ManualOverride as e:
+        print(f"\r\nMANUAL OVERRIDE: {e}")
+    except KeyboardInterrupt:
+        print("\r\nInterrupted by user.")
+    except Exception:
+        print()
+        traceback.print_exc()
+
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+        land_safely(drone)
         swarm.close()
 
 

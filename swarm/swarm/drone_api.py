@@ -9,6 +9,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -147,6 +148,10 @@ class Drone(Node):
         self.gps = NavSatFix()
         self.scan: LaserScan | None = None
         self._last_tf_ns = -1
+
+        # Local position (x, y, z) captured on the ground by takeoff(), just before arming.
+        # Use it to fly relative to the takeoff point, e.g. target z = home[2] + alt.
+        self.home: tuple[float, float, float] | None = None
 
         # Manual Override State
         self.monitor_rc = monitor_rc
@@ -605,49 +610,107 @@ class Drone(Node):
         self.get_logger().warn(f"[{self.name}] Emergency BRAKE activated!")
         return self.set_mode("BRAKE")
 
-    def takeoff(self, alt: float = 1.0, wait: bool = True, tol: float = 0.35) -> bool:
+    def takeoff(
+        self,
+        alt: float = 1.0,
+        wait: bool = True,
+        tol: float = 0.35,
+        ready_timeout: float = 120.0,
+        climb_timeout: float = 30.0,
+    ) -> bool:
+        """GUIDED + arm + climb to `alt` metres ABOVE THE TAKEOFF POINT.
+
+        Records the ground position in `self.home` just before arming.
+
+        Returns True when the drone is within `tol` of the target height (or, with
+        wait=False, as soon as the takeoff command is accepted). Returns False if
+        GUIDED/arming does not succeed within `ready_timeout` seconds, the takeoff
+        command is rejected, or the height is not reached within `climb_timeout`.
+        """
         self.check_override()  # never take control back from a pilot who already overrode
         self.set_stream_rate(rate=20)
-        while rclpy.ok() and not self.set_mode("GUIDED"):
+        t0 = time.monotonic()
+
+        # 1. GUIDED, confirmed by the FCU's reported mode (not just "request sent")
+        self.allow_mode("GUIDED")
+        while not self._set_mode_confirmed("GUIDED", timeout=2.5):
+            self.check_override()
+            if not rclpy.ok() or time.monotonic() - t0 > ready_timeout:
+                self.get_logger().error(f"[{self.name}] Could not enter GUIDED within {ready_timeout:.0f} s")
+                return False
+            self.get_logger().info(f"[{self.name}] Waiting for GUIDED (position estimate not ready?)...")
             time.sleep(1.0)
 
         # Activate external mode-change watchdog once we have entered GUIDED
         with self._lock:
             self._FlightMode_ready = True
+            self.home = (self.pos[0], self.pos[1], self.pos[2])
+        z0 = self.home[2]
 
-        while rclpy.ok() and not self.arm():
+        # 2. Arm
+        while not self.arm():
             self.check_override()
-            self.get_logger().info(f"[{self.name}] Waiting for EKF pre-arm checks...")
+            if not rclpy.ok() or time.monotonic() - t0 > ready_timeout:
+                self.get_logger().error(f"[{self.name}] Could not arm within {ready_timeout:.0f} s")
+                return False
+            self.get_logger().info(f"[{self.name}] Waiting for pre-arm checks...")
             time.sleep(1.5)
 
+        # 3. Takeoff (ArduCopter's takeoff altitude is relative to the takeoff point)
         res = self._call(self.takeoff_client, CommandTOL.Request(altitude=float(alt)))
         if not (res and res.success):
+            self.get_logger().error(f"[{self.name}] Takeoff command rejected")
             return False
 
-        self.get_logger().info(f"[{self.name}] Taking off to {alt:.1f}m...")
-        if wait:
-            t0 = time.time()
-            while rclpy.ok() and (time.time() - t0 < 25.0):
-                self.check_override()
-                if abs(self.get_pos()[2] - alt) <= tol:
-                    self.get_logger().info(f"[{self.name}] Hovering at {alt:.1f}m.")
-                    return True
-                time.sleep(0.2)
-        return True
+        self.get_logger().info(f"[{self.name}] Taking off to {alt:.1f}m above takeoff point...")
+        if not wait:
+            return True
 
-    def land(self, wait: bool = True) -> bool:
+        # 4. Wait for the climb, measured relative to the ground reading (baro offset safe)
+        target_z = z0 + float(alt)
+        t1 = time.monotonic()
+        while rclpy.ok() and time.monotonic() - t1 < climb_timeout:
+            self.check_override()
+            if abs(self.get_pos()[2] - target_z) <= tol:
+                self.get_logger().info(f"[{self.name}] Hovering at {alt:.1f}m.")
+                return True
+            time.sleep(0.2)
+
+        climbed = self.get_pos()[2] - z0
+        self.get_logger().warn(
+            f"[{self.name}] Target height not reached in {climb_timeout:.0f} s (climbed {climbed:.2f} m of {alt:.2f} m)"
+        )
+        return False
+
+    def land(self, wait: bool = True, timeout: float = 90.0) -> bool:
+        """Command LAND.
+
+        With wait=True, blocks until the FCU disarms after touchdown (ArduCopter
+        auto-disarms on landing), so it doesn't depend on z reading exactly 0.
+        Returns True once disarmed (or, with wait=False, when the land command is
+        accepted). Returns False if the command is rejected or the drone is still
+        armed after `timeout` seconds (the FCU stays in LAND either way).
+        """
         self.check_override()  # never command LAND over a pilot who took control
         self.allow_mode("LAND")
         res = self._call(self.land_client, CommandTOL.Request(altitude=0.0))
         if not (res and res.success):
+            self.get_logger().error(f"[{self.name}] Land command rejected")
             return False
         self.get_logger().info(f"[{self.name}] Landing...")
-        if wait:
-            while rclpy.ok() and self.get_pos()[2] > 0.2:
-                self.check_override()  # abort the wait if the pilot takes over mid-landing
-                time.sleep(0.4)
-            self.get_logger().info(f"[{self.name}] Landed.")
-        return True
+        if not wait:
+            return True
+
+        t0 = time.monotonic()
+        while rclpy.ok() and time.monotonic() - t0 < timeout:
+            self.check_override()  # abort the wait if the pilot takes over mid-landing
+            if not self.state.armed:
+                self.get_logger().info(f"[{self.name}] Landed and disarmed.")
+                return True
+            time.sleep(0.4)
+
+        self.get_logger().warn(f"[{self.name}] Still armed {timeout:.0f} s after LAND")
+        return False
 
     def goto(self, x: float, y: float, z: float, yaw: float | None = None):
         """Publish a non-blocking local position setpoint (ignored if manual override is active)."""
@@ -730,7 +793,11 @@ class Swarm:
         **drone_kwargs,
     ):
         if not rclpy.ok():
-            rclpy.init()
+            # No rclpy SIGINT handler: Ctrl+C raises KeyboardInterrupt in the main thread
+            # while the executor keeps spinning, so a mission's except/finally can still
+            # land the drone. (rclpy's default handler shuts ROS down first, which makes
+            # every service call in the cleanup path fail.)
+            rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
 
         self.executor = MultiThreadedExecutor(num_threads=max(4, len(names) * 2))
         self.drones: dict[str, Drone] = {}
