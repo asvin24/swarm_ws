@@ -99,6 +99,7 @@ def launch_setup(context, *args, **kwargs):
         sitl_cmd = [
             'sim_vehicle.py', '-v', 'ArduCopter', '-f', 'gazebo-iris',
             '--model', 'JSON', '-I', str(i), '--no-mavproxy',
+            '--sysid', sysid,  # unique MAVLink system ID per vehicle (SYSID_THISMAV)
             '-A', f'--serial0=udpclient:127.0.0.1:{mavlink_port}',
         ]
         if has_sitl_bin:
@@ -112,7 +113,7 @@ def launch_setup(context, *args, **kwargs):
                     f'fcu_url:=udp://127.0.0.1:{mavlink_port}@',
                     f'namespace:={drone_name}/mavros',
                     f'uas_prefix:=/uas{sysid}',
-                    'tgt_system:=1',
+                    f'tgt_system:={sysid}',  # must match the SITL --sysid above
                 ],
                 output='screen',
             )
