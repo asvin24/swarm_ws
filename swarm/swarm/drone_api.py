@@ -120,6 +120,7 @@ class Drone(Node):
         only_when_armed: bool = True,
         exit_on_override: bool = False,
         on_override=None,
+        service_timeout: float = 10.0,
     ):
         if sim_time is None:
             sim_time = os.environ.get("SWARM_REAL_HW", "0") != "1"
@@ -129,6 +130,9 @@ class Drone(Node):
             parameter_overrides=[Parameter("use_sim_time", Parameter.Type.BOOL, bool(sim_time))],
         )
         self.name = name
+        # How long to wait for MAVROS to answer a service call. A busy sim (several SITL
+        # instances) can take several seconds to acknowledge commands.
+        self.service_timeout = float(service_timeout)
         self.offset_x = float(offset[0])
         self.offset_y = float(offset[1])
 
@@ -556,7 +560,8 @@ class Drone(Node):
     # -------------------------------------------------------------------------
     # Flight Control Actions
     # -------------------------------------------------------------------------
-    def _call(self, client, req, timeout: float = 5.0):
+    def _call(self, client, req, timeout: float | None = None):
+        timeout = self.service_timeout if timeout is None else timeout
         event = threading.Event()
         future = client.call_async(req)
         future.add_done_callback(lambda _: event.set())
@@ -615,7 +620,7 @@ class Drone(Node):
         alt: float = 1.0,
         wait: bool = True,
         tol: float = 0.35,
-        ready_timeout: float = 120.0,
+        ready_timeout: float = 180.0,
         climb_timeout: float = 30.0,
     ) -> bool:
         """GUIDED + arm + climb to `alt` metres ABOVE THE TAKEOFF POINT.
@@ -648,7 +653,7 @@ class Drone(Node):
         z0 = self.home[2]
 
         # 2. Arm
-        while not self.arm():
+        while not (self.arm() or self.state.armed):   # a slow reply can hide a successful arm
             self.check_override()
             if not rclpy.ok() or time.monotonic() - t0 > ready_timeout:
                 self.get_logger().error(f"[{self.name}] Could not arm within {ready_timeout:.0f} s")
@@ -657,8 +662,7 @@ class Drone(Node):
             time.sleep(1.5)
 
         # 3. Takeoff (ArduCopter's takeoff altitude is relative to the takeoff point)
-        res = self._call(self.takeoff_client, CommandTOL.Request(altitude=float(alt)))
-        if not (res and res.success):
+        if not self._send_takeoff(alt, z0):
             self.get_logger().error(f"[{self.name}] Takeoff command rejected")
             return False
 
@@ -682,6 +686,41 @@ class Drone(Node):
         )
         return False
 
+    def _wait_mode(self, mode: str, timeout: float) -> bool:
+        """True if the FCU reports `mode` within `timeout` seconds."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if (self.state.mode or "").upper() == mode.upper():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _climbing(self, z0: float, timeout: float, rise: float = 0.15) -> bool:
+        """True if the drone rises `rise` m above z0 within `timeout` seconds."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.get_pos()[2] - z0 > rise:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _send_takeoff(self, alt: float, z0: float, attempts: int = 2) -> bool:
+        """Send the takeoff command. A reply that is slow or lost is OK if the drone is
+        actually climbing (the FCU executed it); otherwise retry once."""
+        for i in range(attempts):
+            self.check_override()
+            res = self._call(self.takeoff_client, CommandTOL.Request(altitude=float(alt)))
+            if res and res.success:
+                return True
+            if self.state.armed and self._climbing(z0, timeout=5.0):
+                self.get_logger().warn(f"[{self.name}] Takeoff reply {'failed' if res else 'timed out'}, "
+                                       f"but the drone is climbing: continuing")
+                return True
+            if not self.state.armed:
+                return False      # disarmed meanwhile (e.g. auto-disarm after idling on the ground)
+            self.get_logger().warn(f"[{self.name}] Takeoff not confirmed, retrying ({i + 1}/{attempts})")
+        return False
+
     def land(self, wait: bool = True, timeout: float = 90.0) -> bool:
         """Command LAND.
 
@@ -694,7 +733,7 @@ class Drone(Node):
         self.check_override()  # never command LAND over a pilot who took control
         self.allow_mode("LAND")
         res = self._call(self.land_client, CommandTOL.Request(altitude=0.0))
-        if not (res and res.success):
+        if not (res and res.success) and not self._wait_mode("LAND", 3.0):
             self.get_logger().error(f"[{self.name}] Land command rejected")
             return False
         self.get_logger().info(f"[{self.name}] Landing...")
